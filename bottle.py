@@ -2352,7 +2352,7 @@ def static_file(filename, root, mimetype='auto', download=False, charset='UTF-8'
             mime-type. (default: UTF-8)
     """
 
-    root = os.path.abspath(root) + os.sep
+    root = os.path.join(os.path.abspath(root), '')
     filename = os.path.abspath(os.path.join(root, filename.strip('/\\')))
     headers = dict()
 
@@ -3330,27 +3330,49 @@ class StplParser(object):
     """ Parser for stpl templates. """
     _re_cache = {} #: Cache for compiled re patterns
     # This huge pile of voodoo magic splits python code into 8 different tokens.
-    # 1: All kinds of python strings (trust me, it works)
-    _re_tok = '((?m)[urbURB]?(?:\'\'(?!\')|""(?!")|\'{6}|"{6}' \
-               '|\'(?:[^\\\\\']|\\\\.)+?\'|"(?:[^\\\\"]|\\\\.)+?"' \
-               '|\'{3}(?:[^\\\\]|\\\\.|\\n)+?\'{3}' \
-               '|"{3}(?:[^\\\\]|\\\\.|\\n)+?"{3}))'
-    _re_inl = _re_tok.replace('|\\n','') # We re-use this string pattern later
-    # 2: Comments (until end of line, but not the newline itself)
-    _re_tok += '|(#.*)'
-    # 3,4: Keywords that start or continue a python block (only start of line)
-    _re_tok += '|^([ \\t]*(?:if|for|while|with|try|def|class)\\b)' \
-               '|^([ \\t]*(?:elif|else|except|finally)\\b)'
-    # 5: Our special 'end' keyword (but only if it stands alone)
-    _re_tok += '|((?:^|;)[ \\t]*end[ \\t]*(?=(?:%(block_close)s[ \\t]*)?\\r?$|;|#))'
-    # 6: A customizable end-of-code-block template token (only end of line)
-    _re_tok += '|(%(block_close)s[ \\t]*(?=\\r?$))'
-    # 7: And finally, a single newline. The 8th token is 'everything else'
-    _re_tok += '|(\\r?\\n)'
+    # We use the verbose (?x) regex mode to make this more manageable
+
+    _re_tok = r'''((?mx)
+        # 1: All kinds of python strings (trust me, it works)
+        [urbURB]*
+        (?:
+            ''(?!')
+            |""(?!")
+            |'{6}
+            |"{6}
+            |'(?:[^\\']|\\.)+?'
+            |"(?:[^\\"]|\\.)+?"
+            |'{3}(?:[^\\]|\\.|\n)+?'{3}
+            |"{3}(?:[^\\]|\\.|\n)+?"{3}
+        )
+    )'''
+    _re_inl = _re_tok.replace(r'|\n','') # We re-use this string pattern later
+
+    _re_tok += r'''
+        # 2: Comments (until end of line, but not the newline itself)
+        |(\#.*)
+
+        # 3: Open and close (4) grouping tokens
+        |([\[\{\(])
+        |([\]\}\)])
+        
+        # 5,6: Keywords that start or continue a python block (only start of line)
+        |^([\ \t]*(?:if|for|while|with|try|def|class)\b)
+        |^([\ \t]*(?:elif|else|except|finally)\b)
+
+        # 7: Our special 'end' keyword (but only if it stands alone)
+        |((?:^|;)[\ \t]*end[\ \t]*(?=(?:%(block_close)s[\ \t]*)?\r?$|;|\#))
+
+        # 8: A customizable end-of-code-block template token (only end of line)
+        |(%(block_close)s[\ \t]*(?=\r?$))
+
+        # 9: And finally, a single newline. The 10th token is 'everything else'
+        |(\r?\n)
+    '''
     # Match the start tokens of code areas in a template
-    _re_split = '(?m)^[ \t]*(\\\\?)((%(line_start)s)|(%(block_start)s))'
+    _re_split = r'''(?m)^[ \t]*(\\?)((%(line_start)s)|(%(block_start)s))'''
     # Match inline statements (may contain python strings)
-    _re_inl = '%%(inline_start)s((?:%s|[^\'"\n]+?)*?)%%(inline_end)s' % _re_inl
+    _re_inl = r'''%%(inline_start)s((?:%s|[^'"\n]+?)*?)%%(inline_end)s''' % _re_inl
 
     default_syntax = '<% %> % {{ }}'
 
@@ -3360,6 +3382,7 @@ class StplParser(object):
         self.code_buffer, self.text_buffer = [], []
         self.lineno, self.offset = 1, 0
         self.indent, self.indent_mod = 0, 0
+        self.paren_depth = 0
 
     def get_syntax(self):
         """ Tokens as a space separated string (default: <% %> % {{ }}) """
@@ -3382,37 +3405,37 @@ class StplParser(object):
     def translate(self):
         if self.offset: raise RuntimeError('Parser is a one time instance.')
         while True:
-            m = self.re_split.search(self.source[self.offset:])
+            m = self.re_split.search(self.source, pos=self.offset)
             if m:
-                text = self.source[self.offset:self.offset+m.start()]
+                text = self.source[self.offset:m.start()]
                 self.text_buffer.append(text)
-                offs = self.offset
-                self.offset += m.end()
+                self.offset = m.end()
                 if m.group(1): # Escape syntax
                     line, sep, _ = self.source[self.offset:].partition('\n')
-                    self.text_buffer.append(self.source[offs+m.start():offs+m.start(1)]+m.group(2)+line+sep)
+                    self.text_buffer.append(self.source[m.start():m.start(1)]+m.group(2)+line+sep)
                     self.offset += len(line+sep)
                     continue
                 self.flush_text()
-                self.read_code(multiline=bool(m.group(4)))
+                self.offset += self.read_code(self.source[self.offset:], multiline=bool(m.group(4)))
             else: break
         self.text_buffer.append(self.source[self.offset:])
         self.flush_text()
         return ''.join(self.code_buffer)
 
-    def read_code(self, multiline):
+    def read_code(self, pysource, multiline):
         code_line, comment = '', ''
+        offset = 0
         while True:
-            m = self.re_tok.search(self.source[self.offset:])
+            m = self.re_tok.search(pysource, pos=offset)
             if not m:
-                code_line += self.source[self.offset:]
-                self.offset = len(self.source)
+                code_line += pysource[offset:]
+                offset = len(pysource)
                 self.write_code(code_line.strip(), comment)
-                return
-            code_line += self.source[self.offset:self.offset+m.start()]
-            self.offset += m.end()
-            _str, _com, _blk1, _blk2, _end, _cend, _nl = m.groups()
-            if code_line and (_blk1 or _blk2): # a if b else c
+                break
+            code_line += pysource[offset:m.start()]
+            offset = m.end()
+            _str, _com, _po, _pc, _blk1, _blk2, _end, _cend, _nl = m.groups()
+            if self.paren_depth > 0 and (_blk1 or _blk2): # a if b else c
                 code_line += _blk1 or _blk2
                 continue
             if _str:    # Python string
@@ -3421,6 +3444,16 @@ class StplParser(object):
                 comment = _com
                 if multiline and _com.strip().endswith(self._tokens[1]):
                     multiline = False # Allow end-of-block in comments
+            elif _po:  # open parenthesis
+                self.paren_depth += 1
+                code_line += _po
+            elif _pc:  # close parenthesis
+                if self.paren_depth > 0:
+                    # we could check for matching parentheses here, but it's
+                    # easier to leave that to python - just check counts
+                    self.paren_depth -= 1
+                code_line += _pc
+
             elif _blk1: # Start-block keyword (if/for/while/def/try/...)
                 code_line, self.indent_mod = _blk1, -1
                 self.indent += 1
@@ -3437,6 +3470,8 @@ class StplParser(object):
                 code_line, comment, self.indent_mod = '', '', 0
                 if not multiline:
                     break
+
+        return offset
 
     def flush_text(self):
         text = ''.join(self.text_buffer)
